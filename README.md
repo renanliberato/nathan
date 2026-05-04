@@ -1,8 +1,8 @@
-# git-subcommit
+# nathan
 
 **Sub-commit management on top of git.**
 
-AI generates lots of granular commits. Squashing them all loses history. Merging with `--no-ff` still floods `git log` unless you always pass `--first-parent`. git-subcommit gives you the best of both:
+AI generates lots of granular commits. Squashing them all loses history. Merging with `--no-ff` still floods `git log` unless you always pass `--first-parent`. nathan gives you the best of both:
 
 - **main stays clean** — one squashed commit per logical change
 - **micro-commits are preserved** — stored on namespaced `_sub/<id>` branches
@@ -148,7 +148,7 @@ git subcommit fetch origin
 |---|---|---|---|---|
 | Plain squash | ✅ | ❌ | ❌ | ✅ |
 | `--no-ff` merge | ✅ (with `--first-parent`) | ✅ | ⚠️ branch must be kept | ✅ |
-| git-subcommit (this) | ✅ | ✅ | ✅ | ❌ (needs this script) |
+| nathan | ✅ | ✅ | ✅ | ❌ (needs this script) |
 | Plain history | ❌ | ✅ | ✅ | ✅ |
 
 ---

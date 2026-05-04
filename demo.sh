@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Demo: full git-subcommit workflow in a fresh repo
+# Demo: full nathan (git-subcommit) workflow in a fresh repo
 # Run: ./demo.sh
 #
 
@@ -15,7 +15,7 @@ say() { echo -e "${CYAN}▸ $*${NC}"; }
 ok()  { echo -e "${GREEN}✓ $*${NC}"; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DEMO_DIR="$(mktemp -d /tmp/git-subcommit-demo.XXXXXX)"
+DEMO_DIR="$(mktemp -d /tmp/nathan-demo.XXXXXX)"
 trap 'rm -rf "$DEMO_DIR"' EXIT
 
 say "Setting up demo repo in $DEMO_DIR"

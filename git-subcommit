@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# git-subcommit — sub-commit management on top of git
+# git-subcommit — sub-commit management on top of git (project: nathan)
 #
 # A squashed commit on main references a _sub/<id> branch that preserves
 # the full micro-commit history. You can checkout that branch, mutate it
@@ -413,7 +413,7 @@ cmd_fetch() {
 
 usage() {
     cat <<EOF
-git-subcommit ${VERSION} — manage sub-commits on top of git
+nathan (git-subcommit) ${VERSION} — manage sub-commits on top of git
 
 USAGE:
   git subcommit squash <branch>            Squash a branch, save sub-commits

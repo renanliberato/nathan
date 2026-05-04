@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Unit & integration tests for git-subcommit
+# Unit & integration tests for nathan (git-subcommit)
 # Run: ./test.sh
 #
 
@@ -28,7 +28,7 @@ assert_fail() {
 
 setup_repo() {
     local dir
-    dir=$(mktemp -d /tmp/git-subcommit-test.XXXXXX)
+    dir=$(mktemp -d /tmp/nathan-test.XXXXXX)
     cd "$dir"
     git init >/dev/null 2>&1
     git config user.name "Tester"
@@ -682,7 +682,7 @@ test_e2e_full_flow() {
 main() {
     echo ""
     echo "════════════════════════════════════════════"
-    echo "  git-subcommit test suite"
+    echo "  nathan (git-subcommit) test suite"
     echo "════════════════════════════════════════════"
     echo ""
 
