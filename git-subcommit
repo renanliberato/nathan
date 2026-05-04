@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+#
+# git-subcommit — sub-commit management on top of git
+#
+# A squashed commit on main references a _sub/<id> branch that preserves
+# the full micro-commit history. You can checkout that branch, mutate it
+# with normal git operations, then re-squash it back onto main.
+#
+#   git subcommit squash <branch>         squash a branch, save sub-commits
+#   git subcommit squash --range HEAD~3..  squash last N commits, save subs
+#   git subcommit unfold <commit>          checkout sub-commits for a squashed commit
+#   git subcommit resquash [<id>]          re-squash after mutating _sub/<id>
+#   git subcommit list                     list all sub-commit refs
+#   git subcommit show <commit>            show sub-commit log for a squashed commit
+#   git subcommit log <commit>             alias for git log on the _sub/ branch
+#
+
+set -euo pipefail
+
+VERSION="0.1.0"
+SUB_NAMESPACE="_sub"
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+die() { echo "error: $*" >&2; exit 1; }
+
+sub_ref_name() {
+    # Generate a unique sub-commit ref name from timestamp + random
+    local ts rand
+    ts=$(date +%Y%m%d-%H%M%S)
+    rand=$(dd if=/dev/urandom bs=3 count=1 2>/dev/null | base64 | tr '+/' '-_' | tr -d '=')
+    echo "${SUB_NAMESPACE}/${ts}-${rand}"
+}
+
+sub_id_from_ref() {
+    # _sub/20240504-120000-abc → 20240504-120000-abc
+    basename "$1"
+}
+
+find_sub_ref() {
+    # Given a commit hash, find its Sub-commit-ref trailer value
+    git log -1 --format="%(trailers:key=Sub-commit-ref,valueonly)" "$1" 2>/dev/null || true
+}
+
+find_squashed_commit_for_ref() {
+    # Given a sub-ref (like _sub/20240504-120000-abc),
+    # find the squashed commit on main that references it
+    local ref_name="$1"
+    local result=""
+    while read -r hash trailer; do
+        if [[ "$trailer" == *"$ref_name"* ]]; then
+            result="$hash"
+            break
+        fi
+    done < <(git log --all --format="%H %(trailers:key=Sub-commit-ref,valueonly)" 2>/dev/null || true)
+    echo "$result"
+}
+
+current_branch() {
+    git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD"
+}
+
+is_detached() {
+    ! git symbolic-ref -q HEAD >/dev/null 2>&1
+}
+
+ensure_clean() {
+    if ! git diff-index --quiet HEAD -- 2>/dev/null || \
+       [[ -n $(git ls-files --others --exclude-standard 2>/dev/null) ]]; then
+        die "working tree is dirty — stash or commit changes first"
+    fi
+}
+
+# ── squash ─────────────────────────────────────────────────────────────────
+# Create a squashed commit from a branch or range, saving sub-commits to _sub/<id>
+
+cmd_squash() {
+    local source_branch=""
+    local range=""
+    local message=""
+
+    # Parse args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --range) range="$2"; shift 2 ;;
+            -m|--message) message="$2"; shift 2 ;;
+            *) source_branch="$1"; shift ;;
+        esac
+    done
+
+    ensure_clean
+
+    local current
+    current=$(current_branch)
+
+    local sub_ref
+    sub_ref=$(sub_ref_name)
+
+    if [[ -n "$range" ]]; then
+        # Squashing a range of commits on the current branch
+        # Save them to the sub-ref first
+        local range_start range_end
+        range_start=$(echo "$range" | cut -d. -f1)
+        range_end=$(echo "$range" | cut -d. -f3)
+
+        # Resolve refs BEFORE resetting HEAD
+        local range_start_hash range_end_hash
+        range_start_hash=$(git rev-parse "$range_start")
+        range_end_hash=$(git rev-parse "$range_end")
+
+        git branch "$sub_ref" HEAD
+
+        # Extract message before HEAD moves
+        if [[ -z "$message" ]]; then
+            message=$(git log --format="%s" "${range_start_hash}..${range_end_hash}" | head -1)
+        fi
+
+        local parent
+        parent=$(git rev-parse "${range_start}~1" 2>/dev/null || git rev-parse "${range_start}^")
+
+        git reset --soft "$parent"
+        git commit -m "$message"$'\n\n'"Sub-commit-ref: ${sub_ref}"
+
+        echo "Squashed ${range_start}..${range_end} into current commit"
+        echo "Sub-commits saved to: ${sub_ref}"
+        echo ""
+        echo "To see sub-commits:  git subcommit show HEAD"
+        echo "To modify them:      git subcommit unfold HEAD"
+
+    elif [[ -n "$source_branch" ]]; then
+        # Squashing an entire branch
+        if ! git rev-parse --verify "$source_branch" >/dev/null 2>&1; then
+            die "branch '$source_branch' not found"
+        fi
+
+        local merge_base
+        merge_base=$(git merge-base HEAD "$source_branch")
+
+        # Save the branch as sub-ref
+        git branch "$sub_ref" "$source_branch"
+
+        # Squash-merge
+        git merge --squash "$source_branch"
+        if [[ -z "$message" ]]; then
+            message=$(git log --format="%s" "${merge_base}..${source_branch}" | head -1)
+        fi
+        git commit -m "$message"$'\n\n'"Sub-commit-ref: ${sub_ref}"
+
+        echo "Squashed '$source_branch' into $(current_branch)"
+        echo "Sub-commits saved to: ${sub_ref}"
+        echo ""
+        echo "To see sub-commits:  git subcommit show HEAD"
+        echo "To modify them:      git subcommit unfold HEAD"
+
+    else
+        die "specify a branch or --range to squash"
+    fi
+}
+
+# ── unfold ─────────────────────────────────────────────────────────────────
+# Given a squashed commit, checkout its sub-commits as a working branch
+
+cmd_unfold() {
+    local commit="${1:-HEAD}"
+
+    # Resolve refs BEFORE changing branches (git checkout will move HEAD)
+    local squashed_hash squashed_parent
+    squashed_hash=$(git rev-parse "$commit")
+    squashed_parent=$(git rev-parse "${commit}^" 2>/dev/null || echo "")
+
+    local sub_ref
+    sub_ref=$(find_sub_ref "$commit")
+
+    if [[ -z "$sub_ref" ]]; then
+        die "commit $commit has no Sub-commit-ref trailer"
+    fi
+
+    if ! git rev-parse --verify "$sub_ref" >/dev/null 2>&1; then
+        die "sub-commit ref '$sub_ref' not found (was it garbage-collected or not pushed?)"
+    fi
+
+    ensure_clean
+
+    local short_id
+    short_id=$(sub_id_from_ref "$sub_ref")
+
+    # Create a working branch from the sub-ref
+    local work_branch="_work/${short_id}"
+    git checkout -B "$work_branch" "$sub_ref"
+
+    if [[ -n "$squashed_parent" ]]; then
+        echo "Checked out ${work_branch} with $(git rev-list --count HEAD ^"${squashed_parent}" 2>/dev/null || echo '?') sub-commits"
+    else
+        echo "Checked out ${work_branch} with $(git rev-list --count HEAD 2>/dev/null || echo '?') sub-commits (root)"
+    fi
+    echo ""
+    echo "You are now on a working branch. Use normal git commands:"
+    echo "  git rebase -i HEAD~3     # drop, edit, reorder sub-commits"
+    echo "  git commit --amend        # modify the top sub-commit"
+    echo "  git cherry-pick <hash>    # add a new sub-commit"
+    echo ""
+    echo "When done:  git subcommit resquash ${short_id}"
+}
+
+# ── resquash ───────────────────────────────────────────────────────────────
+# After modifying a _work/* branch (unfolded sub-commits), re-squash onto main
+
+cmd_resquash() {
+    local id="${1:-}"
+
+    if [[ -z "$id" ]]; then
+        # Try to figure out which sub-ref we're working on
+        local current
+        current=$(current_branch)
+        if [[ "$current" == _work/* ]]; then
+            id="${current#_work/}"
+        else
+            die "specify sub-commit id, or run from a _work/* branch"
+        fi
+    fi
+
+    local sub_ref="${SUB_NAMESPACE}/${id}"
+    local work_branch="_work/${id}"
+
+    if ! git rev-parse --verify "$sub_ref" >/dev/null 2>&1; then
+        die "sub-ref '$sub_ref' not found"
+    fi
+
+    ensure_clean
+
+    # Find the squashed commit on main that references this sub-ref
+    local squashed_commit
+    squashed_commit=$(find_squashed_commit_for_ref "$sub_ref")
+
+    if [[ -z "$squashed_commit" ]]; then
+        die "no squashed commit found referencing '$sub_ref' on any branch"
+    fi
+
+    local parent
+    parent=$(git rev-parse "${squashed_commit}^")
+
+    local current_work
+    current_work=$(git rev-parse HEAD)
+
+    # Update the sub-ref to point to current work
+    git branch -f "$sub_ref" "$current_work"
+
+    # Create new squashed commit from parent
+    local temp_branch="_temp/resquash-${id}"
+    git checkout -B "$temp_branch" "$parent"
+    git merge --squash "$sub_ref"
+
+    local old_message
+    old_message=$(git log -1 --format="%B" "$squashed_commit" | sed '/^Sub-commit-ref:/d')
+
+    git commit -m "${old_message}"$'\n\n'"Sub-commit-ref: ${sub_ref}"
+
+    local new_squash
+    new_squash=$(git rev-parse HEAD)
+
+    # Now update the target branch. If the squashed commit is the tip of
+    # the target branch, just reset to the new squash. Otherwise rebase
+    # commits after the old squash onto the new one.
+    local target_branch
+    target_branch=$(git branch --contains "$squashed_commit" --format="%(refname:short)" 2>/dev/null | grep -v '_temp\|_work\|_sub' | head -1)
+    if [[ -z "$target_branch" ]]; then
+        target_branch="HEAD"
+    fi
+
+    if [[ "$target_branch" == "HEAD" ]] || ! git rev-parse --verify "$target_branch" >/dev/null 2>&1; then
+        # We're detached or no target found — just stay on the new squash
+        echo "Re-squashed! Sub-commits updated in ${sub_ref}"
+        echo "You are now on ${temp_branch} with the new squash."
+        echo "Switch to main and reset:  git checkout main && git reset --hard ${temp_branch}"
+        return 0
+    fi
+
+    if [[ "$(git rev-parse "$squashed_commit")" == "$(git rev-parse "$target_branch")" ]]; then
+        # Old squash was the tip of target — simple replacement
+        git checkout "$target_branch"
+        git reset --hard "$temp_branch"
+    elif git merge-base --is-ancestor "$squashed_commit" "$target_branch" 2>/dev/null; then
+        # There are commits after the old squash — rebase them
+        echo "Rebasing commits after old squashed commit onto new squash..."
+        git rebase --onto "$temp_branch" "$squashed_commit" "$target_branch" || {
+            echo ""
+            echo "Rebase had conflicts. Resolve them, then:"
+            echo "  git rebase --continue"
+            die "conflicts during rebase"
+        }
+    else
+        # Old squash not on target — something odd. Just replace.
+        git checkout "$target_branch" 2>/dev/null || true
+        git reset --hard "$temp_branch" 2>/dev/null || true
+    fi
+
+    # Cleanup temp branch
+    git branch -D "$temp_branch" 2>/dev/null || true
+
+    echo "Re-squashed! Sub-commits updated in ${sub_ref}"
+    echo "To see:  git subcommit show HEAD"
+}
+
+# ── show ───────────────────────────────────────────────────────────────────
+# Show the sub-commit log for a squashed commit
+
+cmd_show() {
+    local commit="${1:-HEAD}"
+
+    local sub_ref
+    sub_ref=$(find_sub_ref "$commit")
+
+    if [[ -z "$sub_ref" ]]; then
+        echo "Commit $commit does not reference sub-commits"
+        echo ""
+        echo "Message:"
+        git log -1 --format="%B" "$commit"
+        exit 0
+    fi
+
+    local parent
+    parent=$(git rev-parse "${commit}^" 2>/dev/null || echo "")
+
+    echo "═╤═ Squashed commit: $(git log -1 --format='%h %s' "$commit")"
+    echo " ║  Sub-commit-ref:  ${sub_ref}"
+    echo " ║"
+
+    if git rev-parse --verify "$sub_ref" >/dev/null 2>&1; then
+        echo " ║  Sub-commits:"
+        if [[ -n "$parent" ]]; then
+            git log --oneline --reverse "${parent}..${sub_ref}" | while read -r line; do
+                echo " ║    • $line"
+            done
+        else
+            git log --oneline --reverse "${sub_ref}" | while read -r line; do
+                echo " ║    • $line"
+            done
+        fi
+    else
+        echo " ║  ⚠ sub-commit ref not found (not pushed or GC'd)"
+    fi
+    echo " ║"
+    echo "═╧═ git subcommit unfold $commit    # to edit sub-commits"
+}
+
+# ── list ───────────────────────────────────────────────────────────────────
+# List all sub-commit refs
+
+cmd_list() {
+    echo "Sub-commit refs:"
+    echo ""
+
+    local found=0
+    while read -r ref; do
+        found=1
+        local squashed
+        squashed=$(find_squashed_commit_for_ref "$ref")
+        local count
+        count=$(git rev-list --count "$ref" 2>/dev/null || echo "?")
+        if [[ -n "$squashed" ]]; then
+            echo "  $ref  ($count sub-commits → $(git log -1 --format='%h %s' "$squashed" 2>/dev/null))"
+        else
+            echo "  $ref  ($count sub-commits → orphaned, no squashed commit found)"
+        fi
+    done < <(git for-each-ref --format="%(refname:short)" "refs/heads/${SUB_NAMESPACE}/*" 2>/dev/null || true)
+
+    if [[ $found -eq 0 ]]; then
+        echo "  (none)"
+    fi
+}
+
+# ── log ────────────────────────────────────────────────────────────────────
+# Run git log on the sub-commit branch
+
+cmd_log() {
+    local commit="${1:-HEAD}"
+
+    local sub_ref
+    sub_ref=$(find_sub_ref "$commit")
+    if [[ -z "$sub_ref" ]]; then
+        die "commit $commit has no Sub-commit-ref trailer"
+    fi
+    if ! git rev-parse --verify "$sub_ref" >/dev/null 2>&1; then
+        die "sub-ref '$sub_ref' not found"
+    fi
+
+    shift 2>/dev/null || true
+    local parent
+    parent=$(git rev-parse "${commit}^" 2>/dev/null || echo "")
+    if [[ -n "$parent" ]]; then
+        git log "${@}" "${parent}..${sub_ref}"
+    else
+        git log "${@}" "${sub_ref}"
+    fi
+}
+
+# ── push / pull helpers ────────────────────────────────────────────────────
+
+cmd_push() {
+    # Push sub-commit refs alongside regular refs
+    local remote="${1:-origin}"
+    git push "$remote" "refs/heads/${SUB_NAMESPACE}/*"
+    echo "Pushed all sub-commit refs to $remote"
+}
+
+cmd_fetch() {
+    local remote="${1:-origin}"
+    git fetch "$remote" "refs/heads/${SUB_NAMESPACE}/*"
+    echo "Fetched all sub-commit refs from $remote"
+}
+
+# ── main ───────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+git-subcommit ${VERSION} — manage sub-commits on top of git
+
+USAGE:
+  git subcommit squash <branch>            Squash a branch, save sub-commits
+  git subcommit squash --range HEAD~3..    Squash last N commits, save subs
+  git subcommit unfold <commit>            Checkout sub-commits for editing
+  git subcommit resquash [<id>]            Re-squash after modifying sub-commits
+  git subcommit show <commit>              Show sub-commit log
+  git subcommit log <commit> [git-log-args] Show full git log of sub-commits
+  git subcommit list                       List all sub-commit refs
+  git subcommit push [remote]              Push sub-commit refs
+  git subcommit fetch [remote]             Fetch sub-commit refs
+
+HOW IT WORKS:
+  Squashed commits on main carry a "Sub-commit-ref" trailer pointing to
+  a _sub/<id> branch. That branch preserves the full micro-commit history.
+  You can git checkout _sub/<id>, mutate it with normal git commands
+  (rebase -i, cherry-pick, commit), then re-squash it onto main.
+
+  This means:
+    • main stays clean (--first-parent shows only squashed commits)
+    • micro-commits are preserved and reachable (no GC) under _sub/*
+    • you can drop, add, or edit individual micro-commits at any time
+    • compatible with any git forge or tooling
+EOF
+    exit 0
+}
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+
+    case "$cmd" in
+        squash)     cmd_squash "$@" ;;
+        unfold)     cmd_unfold "$@" ;;
+        resquash)   cmd_resquash "$@" ;;
+        show)       cmd_show "$@" ;;
+        list|ls)    cmd_list "$@" ;;
+        log)        cmd_log "$@" ;;
+        push)       cmd_push "$@" ;;
+        fetch)      cmd_fetch "$@" ;;
+        -h|--help|help) usage ;;
+        "")         usage ;;
+        *)
+            die "unknown command '$cmd'. Try: git subcommit --help"
+            ;;
+    esac
+}
+
+main "$@"
