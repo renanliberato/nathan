@@ -228,7 +228,11 @@ test_unfold() {
     fi
 
     # Should see sub-commits in log
-    if git log --oneline | grep -q "sub: a"; then
+    # Note: avoid grep -q in pipelines with pipefail (SIGPIPE from early match
+    # causes pipeline exit code != 0 even when the match succeeds).
+    local log
+    log=$(git log --oneline)
+    if echo "$log" | grep -q "sub: a"; then
         assert_pass "unfolded branch has sub-commit messages"
     else
         assert_fail "unfolded branch has sub-commit messages" "missing"
@@ -256,16 +260,18 @@ test_drop_subcommit() {
     "$SUBCOMMIT" unfold HEAD >/dev/null 2>&1
 
     # Drop the commit containing "drop"
-    GIT_SEQUENCE_EDITOR="sed -i '/drop/d'" git rebase -i HEAD~3 >/dev/null 2>&1
+    GIT_SEQUENCE_EDITOR="sed -i '' '/drop/d'" git rebase -i HEAD~3 >/dev/null 2>&1
 
-    # Verify drop-me is gone
-    if ! git log --oneline | grep -q "drop-me"; then
+    # Verify drop-me is gone (capture log to avoid SIGPIPE with grep -q + pipefail)
+    local log_drop
+    log_drop=$(git log --oneline)
+    if ! echo "$log_drop" | grep -q "drop-me"; then
         assert_pass "drop sub-commit removed 'drop-me' commit"
     else
         assert_fail "drop sub-commit removed 'drop-me' commit" "still present"
     fi
 
-    if git log --oneline | grep -q "keep1" && git log --oneline | grep -q "keep2"; then
+    if echo "$log_drop" | grep -q "keep1" && echo "$log_drop" | grep -q "keep2"; then
         assert_pass "drop sub-commit keeps other commits intact"
     else
         assert_fail "drop sub-commit keeps other commits intact" "some commits lost"
@@ -292,14 +298,16 @@ test_add_subcommit() {
 
     # Add a new sub-commit
     commit_file "added.txt" "new" "feat: newly-added"
-    if git log --oneline | grep -q "newly-added"; then
+    local log_add
+    log_add=$(git log --oneline)
+    if echo "$log_add" | grep -q "newly-added"; then
         assert_pass "add sub-commit creates new commit"
     else
         assert_fail "add sub-commit creates new commit" "missing"
     fi
 
     # Original should still be there
-    if git log --oneline | grep -q "original"; then
+    if echo "$log_add" | grep -q "original"; then
         assert_pass "add sub-commit preserves original commits"
     else
         assert_fail "add sub-commit preserves original commits" "original lost"
@@ -627,8 +635,10 @@ test_e2e_full_flow() {
     fi
 
     # Drop middle commit
-    GIT_SEQUENCE_EDITOR="sed -i '/add b/d'" git rebase -i HEAD~3 >/dev/null 2>&1
-    if ! git log --oneline | grep -q "add b"; then
+    GIT_SEQUENCE_EDITOR="sed -i '' '/add b/d'" git rebase -i HEAD~3 >/dev/null 2>&1
+    local log_e2e
+    log_e2e=$(git log --oneline)
+    if ! echo "$log_e2e" | grep -q "add b"; then
         assert_pass "e2e: dropped middle sub-commit"
     else
         assert_fail "e2e: dropped middle sub-commit" "still there"
@@ -636,7 +646,8 @@ test_e2e_full_flow() {
 
     # Add new commit
     commit_file "src/d.ts" "d" "feat: add d"
-    if git log --oneline | grep -q "add d"; then
+    log_e2e=$(git log --oneline)
+    if echo "$log_e2e" | grep -q "add d"; then
         assert_pass "e2e: added new sub-commit"
     else
         assert_fail "e2e: added new sub-commit" "missing"
