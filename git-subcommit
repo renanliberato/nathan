@@ -501,8 +501,14 @@ cmd_list() {
         local squashed
         squashed=$(find_squashed_commit_for_ref "$ref")
         local count
-        count=$(git rev-list --count "$ref" 2>/dev/null || echo "?")
         if [[ -n "$squashed" ]]; then
+            local parent
+            parent=$(safe_parent "$squashed")
+            if [[ -n "$parent" ]]; then
+                count=$(git rev-list --count "${parent}..${ref}" 2>/dev/null || echo "?")
+            else
+                count=$(git rev-list --count "$ref" 2>/dev/null || echo "?")
+            fi
             echo "  $ref  ($count sub-commits → $(git log -1 --format='%h %s' "$squashed" 2>/dev/null))"
         else
             echo "  $ref  ($count sub-commits → orphaned, no squashed commit found)"
