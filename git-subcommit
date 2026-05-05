@@ -215,17 +215,22 @@ cmd_squash() {
 
     if [[ -n "$range" ]]; then
         # Squashing a range of commits on the current branch
-        # Save them to the sub-ref first
+        # Save them to the sub-ref first, at the range END (not HEAD)
         local range_start range_end
         range_start=$(echo "$range" | cut -d. -f1)
         range_end=$(echo "$range" | cut -d. -f3)
 
-        # Resolve refs BEFORE resetting HEAD
+        # Resolve refs BEFORE moving HEAD
         local range_start_hash range_end_hash
         range_start_hash=$(git rev-parse "$range_start")
         range_end_hash=$(git rev-parse "$range_end")
 
-        git branch "$sub_ref" HEAD
+        # Capture original HEAD before moving
+        local original_head
+        original_head=$(git rev-parse HEAD)
+
+        # Save sub-ref at the exact range end, not HEAD
+        git branch "$sub_ref" "$range_end_hash"
 
         # Extract message before HEAD moves
         if [[ -z "$message" ]]; then
@@ -235,10 +240,33 @@ cmd_squash() {
         local parent
         parent=$(git rev-parse "${range_start}~1" 2>/dev/null || git rev-parse "${range_start}^")
 
-        git reset --soft "$parent"
+        local short_id
+        short_id=$(sub_id_from_ref "$sub_ref")
+        local temp_branch="_temp/range-squash-${short_id}"
+
+        # Create squashed commit on a temp branch from parent
+        git checkout -B "$temp_branch" "$parent" >/dev/null 2>&1
+        git merge --squash "$sub_ref" >/dev/null 2>&1
         git commit -m "$message"$'\n\n'"Sub-commit-ref: ${sub_ref}"
 
-        echo "Squashed ${range_start}..${range_end} into current commit"
+        # If there are commits after the range end, rebase them onto the squash
+        if [[ "$range_end_hash" != "$original_head" ]]; then
+            echo "Rebasing commits after ${range_end} onto squashed commit..."
+            git rebase --onto "$temp_branch" "$range_end_hash" "$current" || {
+                echo ""
+                echo "Rebase had conflicts. Resolve them, then:"
+                echo "  git rebase --continue"
+                die "conflicts during rebase"
+            }
+        else
+            # No commits after range — simple replacement
+            git checkout -B "$current" "$temp_branch" >/dev/null 2>&1
+        fi
+
+        # Cleanup
+        git branch -D "$temp_branch" >/dev/null 2>&1
+
+        echo "Squashed ${range_start}..${range_end} into a single commit"
         echo "Sub-commits saved to: ${sub_ref}"
         echo ""
         echo "To see sub-commits:  git subcommit show HEAD"
