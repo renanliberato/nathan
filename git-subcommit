@@ -37,6 +37,17 @@ sub_id_from_ref() {
     basename "$1"
 }
 
+safe_parent() {
+    # Resolve the parent of a commit, handling root commits safely.
+    # Returns empty string for root commits, the parent hash otherwise.
+    local c="$1"
+    if git rev-parse --verify "${c}^" >/dev/null 2>&1; then
+        git rev-parse "${c}^"
+    else
+        echo ""
+    fi
+}
+
 find_sub_ref() {
     # Given a commit hash, find its Sub-commit-ref trailer value
     git log -1 --format="%(trailers:key=Sub-commit-ref,valueonly)" "$1" 2>/dev/null || true
@@ -69,6 +80,112 @@ ensure_clean() {
        [[ -n $(git ls-files --others --exclude-standard 2>/dev/null) ]]; then
         die "working tree is dirty — stash or commit changes first"
     fi
+}
+
+# ── adopt ──────────────────────────────────────────────────────────────────
+# Migrate a regular commit (without Sub-commit-ref) to the sub-commit structure.
+# Creates a _sub/<id> branch from the commit, adds the Sub-commit-ref trailer,
+# and replaces the commit on its branch (rebasing children if needed).
+
+cmd_adopt() {
+    local commit="${1:-HEAD}"
+
+    local target_hash
+    target_hash=$(git rev-parse "$commit")
+
+    # Check if it already has a Sub-commit-ref
+    local existing_ref
+    existing_ref=$(find_sub_ref "$target_hash")
+    if [[ -n "$existing_ref" ]]; then
+        die "commit $commit already has a Sub-commit-ref (${existing_ref}). Use 'unfold' instead."
+    fi
+
+    ensure_clean
+
+    local target_tree target_parent orig_message
+    target_tree=$(git rev-parse "${target_hash}^{tree}")
+    # Resolve parent, handling root commits (git rev-parse <hash>^ outputs hash^ + exits 128)
+    if git rev-parse --verify "${target_hash}^" >/dev/null 2>&1; then
+        target_parent=$(git rev-parse "${target_hash}^")
+    else
+        target_parent=""
+    fi
+    orig_message=$(git log -1 --format="%B" "$target_hash")
+
+    local sub_ref
+    sub_ref=$(sub_ref_name)
+    local short_id
+    short_id=$(sub_id_from_ref "$sub_ref")
+
+    # Create the _sub/<id> branch with one commit reproducing the squashed commit
+    local subject_line
+    subject_line=$(git log -1 --format="%s" "$target_hash")
+    local sub_commit_hash
+    if [[ -n "$target_parent" ]]; then
+        sub_commit_hash=$(echo "$subject_line" | git commit-tree "$target_tree" -p "$target_parent")
+    else
+        sub_commit_hash=$(echo "$subject_line" | git commit-tree "$target_tree")
+    fi
+    git branch "$sub_ref" "$sub_commit_hash" >/dev/null 2>&1
+
+    # Create replacement squashed commit with Sub-commit-ref trailer
+    local new_message="${orig_message}"$'\n\n'"Sub-commit-ref: ${sub_ref}"
+    local new_hash
+    if [[ -n "$target_parent" ]]; then
+        new_hash=$(echo "$new_message" | git commit-tree "$target_tree" -p "$target_parent")
+    else
+        new_hash=$(echo "$new_message" | git commit-tree "$target_tree")
+    fi
+
+    # Now replace the old commit on its branch, handling children
+    local current_branch_name
+    current_branch_name=$(current_branch)
+    local target_branch
+    target_branch=$(git branch --contains "$target_hash" --format="%(refname:short)" 2>/dev/null | grep -v '_temp\|_work\|_sub' | head -1)
+
+    if [[ -z "$target_branch" ]] || [[ "$target_branch" == "HEAD" ]]; then
+        # Detached HEAD — just print info
+        echo "Adopted! Sub-commit ref created: ${sub_ref}"
+        echo ""
+        echo "Replacement commit: $(git log -1 --format='%h' "$new_hash")"
+        echo "Original commit:    $(git log -1 --format='%h' "$target_hash")"
+        echo ""
+        echo "Switch to a branch and update:  git checkout <branch> && git commit-tree ... or"
+        echo "Use 'git subcommit unfold ${new_hash}' to start editing sub-commits"
+        return 0
+    fi
+
+    # We found the branch containing the target commit
+    if [[ "$(git rev-parse "$target_hash")" == "$(git rev-parse "$target_branch")" ]]; then
+        # Target commit is the tip of its branch — simple replacement
+        git checkout "$target_branch" >/dev/null 2>&1
+        # Use a temp branch to move safely
+        local temp_branch="_temp/adopt-${short_id}"
+        git branch -f "$temp_branch" "$new_hash" >/dev/null 2>&1
+        git reset --hard "$temp_branch" >/dev/null 2>&1
+        git branch -D "$temp_branch" >/dev/null 2>&1
+        echo "Adopted! Commit replaced with sub-commit-ref."
+    elif git merge-base --is-ancestor "$target_hash" "$target_branch" 2>/dev/null; then
+        # There are commits after the old commit — rebase them
+        local temp_branch="_temp/adopt-${short_id}"
+        git branch -f "$temp_branch" "$new_hash" >/dev/null 2>&1
+        echo "Rebasing commits after the adopted commit onto the new commit..."
+        git rebase --onto "$temp_branch" "$target_hash" "$target_branch" || {
+            echo ""
+            echo "Rebase had conflicts. Resolve them, then:"
+            echo "  git rebase --continue"
+            die "conflicts during rebase"
+        }
+        git branch -D "$temp_branch" >/dev/null 2>&1
+        echo "Adopted! Commit and following commits rebased."
+    else
+        die "target commit is not an ancestor of any branch (unexpected state)"
+    fi
+
+    echo ""
+    echo "Sub-commit ref:     ${sub_ref}"
+    echo "To edit sub-commits:  git subcommit unfold HEAD"
+    echo "To append:            git subcommit unfold HEAD  →  add commits  →  git subcommit resquash"
 }
 
 # ── squash ─────────────────────────────────────────────────────────────────
@@ -319,7 +436,7 @@ cmd_show() {
     fi
 
     local parent
-    parent=$(git rev-parse "${commit}^" 2>/dev/null || echo "")
+    parent=$(safe_parent "$commit")
 
     echo "═╤═ Squashed commit: $(git log -1 --format='%h %s' "$commit")"
     echo " ║  Sub-commit-ref:  ${sub_ref}"
@@ -386,7 +503,7 @@ cmd_log() {
 
     shift 2>/dev/null || true
     local parent
-    parent=$(git rev-parse "${commit}^" 2>/dev/null || echo "")
+    parent=$(safe_parent "$commit")
     if [[ -n "$parent" ]]; then
         git log "${@}" "${parent}..${sub_ref}"
     else
@@ -418,6 +535,7 @@ nathan (git-subcommit) ${VERSION} — manage sub-commits on top of git
 USAGE:
   git subcommit squash <branch>            Squash a branch, save sub-commits
   git subcommit squash --range HEAD~3..    Squash last N commits, save subs
+  git subcommit adopt <commit>             Migrate a plain commit to sub-commit structure
   git subcommit unfold <commit>            Checkout sub-commits for editing
   git subcommit resquash [<id>]            Re-squash after modifying sub-commits
   git subcommit show <commit>              Show sub-commit log
@@ -447,6 +565,7 @@ main() {
 
     case "$cmd" in
         squash)     cmd_squash "$@" ;;
+        adopt)      cmd_adopt "$@" ;;
         unfold)     cmd_unfold "$@" ;;
         resquash)   cmd_resquash "$@" ;;
         show)       cmd_show "$@" ;;

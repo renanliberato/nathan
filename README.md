@@ -100,7 +100,29 @@ git log --oneline main
 # g4h5i6j Add authentication system   ← new (rebased)
 ```
 
-### 5. Push / share
+### 5. Adopt an existing commit (migrate to sub-commit structure)
+
+```bash
+# Take a regular commit (no Sub-commit-ref) and migrate it
+# This happens transparently — the commit message gains the trailer,
+# child commits are automatically rebased.
+git subcommit adopt HEAD
+# → Creates _sub/<id> from HEAD
+# → Replaces HEAD with same tree + message + Sub-commit-ref trailer
+# → If HEAD has children, they are rebased onto the new commit
+
+# Now you can treat it like any squashed commit:
+git subcommit show HEAD
+git subcommit unfold HEAD    # edit sub-commits
+git subcommit resquash       # re-squash
+```
+
+This is useful when you have an existing commit that wasn't created
+via `git subcommit squash` but you want to start managing its
+micro-commits with nathan. Run `adopt`, then `unfold`, add more
+commits, and `resquash`.
+
+### 6. Push / share
 
 ```bash
 # Push sub-commit refs alongside regular refs
@@ -118,6 +140,7 @@ git subcommit fetch origin
 |---|---|
 | `git subcommit squash <branch>` | Squash a branch, save sub-commits to `_sub/<id>` |
 | `git subcommit squash --range HEAD~3..` | Squash last N commits on current branch |
+| `git subcommit adopt <commit>` | Migrate a plain commit to the sub-commit structure |
 | `git subcommit show <commit>` | Show sub-commit log inside a squashed commit |
 | `git subcommit unfold <commit>` | Checkout sub-commits as `_work/<id>` for editing |
 | `git subcommit resquash [<id>]` | Re-squash after mutating sub-commits |
@@ -171,7 +194,9 @@ git subcommit --help
 | Scenario | How it works |
 |---|---|
 | Sub-commit ref not pushed | `git subcommit show` warns; `unfold` fails with explanation |
-| Working tree dirty during resquash | Refuses; tells you to stash |
+| Working tree dirty during adopt/resquash | Refuses; tells you to stash |
+| Commit already has Sub-commit-ref | `adopt` refuses with clear message; use `unfold` instead |
+| Root commit (no parent) | `adopt` creates the sub-ref from the root commit; `show`/`log` handle it gracefully |
 | Commits on main after the squashed commit | Rebased automatically onto new squash |
 | Rebase conflicts during resquash | Drops into interactive rebase resolution |
 | Multiple sub-commit refs | `git subcommit list` shows all with their squashed commit |

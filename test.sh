@@ -688,6 +688,218 @@ test_e2e_full_flow() {
     rm -rf "$dir"
 }
 
+# ── Test: adopt a plain commit (tip) ─────────────────────────────────────────
+
+test_adopt_tip() {
+    echo -e "${CYAN}▶ test_adopt_tip${NC}"
+    local dir
+    dir=$(setup_repo)
+    cd "$dir"
+
+    commit_file "base.txt" "base" "initial"
+    commit_file "a.ts" "a" "feat: add a"
+
+    "$SUBCOMMIT" adopt HEAD >/dev/null 2>&1
+
+    if git log -1 --format="%(trailers:key=Sub-commit-ref,valueonly)" | grep -q "_sub/"; then
+        assert_pass "adopt tip creates sub-commit-ref trailer"
+    else
+        assert_fail "adopt tip creates sub-commit-ref trailer" "missing"
+    fi
+
+    local show_out
+    show_out=$("$SUBCOMMIT" show HEAD 2>&1)
+    if echo "$show_out" | grep -q "Sub-commit-ref:"; then
+        assert_pass "adopt tip: show displays sub-commit-ref"
+    else
+        assert_fail "adopt tip: show displays sub-commit-ref" "missing"
+    fi
+
+    rm -rf "$dir"
+}
+
+# ── Test: adopt a commit in the middle of history (with children) ────────────
+
+test_adopt_with_children() {
+    echo -e "${CYAN}▶ test_adopt_with_children${NC}"
+    local dir
+    dir=$(setup_repo)
+    cd "$dir"
+
+    commit_file "base.txt" "base" "initial"
+    commit_file "a.ts" "a" "feat: add a"
+    commit_file "b.ts" "b" "feat: add b"
+    commit_file "c.ts" "c" "feat: add c"
+
+    "$SUBCOMMIT" adopt HEAD~2 >/dev/null 2>&1
+
+    # The adopted commit should have a sub-ref
+    local show_out
+    show_out=$("$SUBCOMMIT" show HEAD~2 2>&1)
+    if echo "$show_out" | grep -q "Sub-commit-ref:"; then
+        assert_pass "adopt middle commit creates sub-ref"
+    else
+        assert_fail "adopt middle commit creates sub-ref" "missing"
+    fi
+
+    # Children should still be present
+    if [[ -f a.ts && -f b.ts && -f c.ts ]]; then
+        assert_pass "adopt preserves content of all commits"
+    else
+        assert_fail "adopt preserves content of all commits" "files missing"
+    fi
+
+    # Main should still have 4 commits
+    local count
+    count=$(git rev-list --count main)
+    if [[ "$count" -eq 4 ]]; then
+        assert_pass "adopt keeps same number of commits on main"
+    else
+        assert_fail "adopt keeps same number of commits on main" "got $count"
+    fi
+
+    rm -rf "$dir"
+}
+
+# ── Test: adopt a root commit ───────────────────────────────────────────────
+
+test_adopt_root() {
+    echo -e "${CYAN}▶ test_adopt_root${NC}"
+    local dir
+    dir=$(setup_repo)
+    cd "$dir"
+
+    commit_file "README.md" "# Project" "Initial commit"
+
+    "$SUBCOMMIT" adopt HEAD >/dev/null 2>&1
+
+    if git log -1 --format="%(trailers:key=Sub-commit-ref,valueonly)" | grep -q "_sub/"; then
+        assert_pass "adopt root creates sub-ref"
+    else
+        assert_fail "adopt root creates sub-ref" "missing"
+    fi
+
+    local show_out
+    show_out=$("$SUBCOMMIT" show HEAD 2>&1)
+    if echo "$show_out" | grep -q "Sub-commit-ref:"; then
+        assert_pass "adopt root: show works"
+    else
+        assert_fail "adopt root: show works" "unexpected output"
+    fi
+
+    rm -rf "$dir"
+}
+
+# ── Test: adopt on commit that already has a sub-ref (should fail) ───────────
+
+test_adopt_already_adopted() {
+    echo -e "${CYAN}▶ test_adopt_already_adopted${NC}"
+    local dir
+    dir=$(setup_repo)
+    cd "$dir"
+
+    commit_file "base.txt" "base" "initial"
+    git checkout -b feat >/dev/null 2>&1
+    commit_file "a.txt" "a" "sub: a"
+    git checkout main >/dev/null 2>&1
+    "$SUBCOMMIT" squash feat >/dev/null 2>&1
+
+    set +e
+    local output
+    output=$("$SUBCOMMIT" adopt HEAD 2>&1)
+    local rc=$?
+    set -e
+
+    if [[ $rc -ne 0 ]] && echo "$output" | grep -q "already has a Sub-commit-ref"; then
+        assert_pass "adopt on already-adopted commit fails with clear message"
+    else
+        assert_fail "adopt on already-adopted commit fails with clear message" "rc=$rc output=$output"
+    fi
+
+    rm -rf "$dir"
+}
+
+# ── Test: adopt with dirty tree (should fail) ───────────────────────────────
+
+test_adopt_dirty() {
+    echo -e "${CYAN}▶ test_adopt_dirty${NC}"
+    local dir
+    dir=$(setup_repo)
+    cd "$dir"
+
+    commit_file "base.txt" "base" "initial"
+    commit_file "a.ts" "a" "feat: a"
+    echo "dirty" > dirty.txt
+
+    set +e
+    local output
+    output=$("$SUBCOMMIT" adopt HEAD 2>&1)
+    local rc=$?
+    set -e
+
+    if [[ $rc -ne 0 ]]; then
+        assert_pass "adopt rejects dirty working tree"
+    else
+        assert_fail "adopt rejects dirty working tree" "unexpected success"
+    fi
+
+    rm -rf "$dir"
+}
+
+# ── Test: adopt then unfold → add → resquash (full append flow) ─────────────
+
+test_adopt_full_flow() {
+    echo -e "${CYAN}▶ test_adopt_full_flow${NC}"
+    local dir
+    dir=$(setup_repo)
+    cd "$dir"
+
+    commit_file "base.txt" "base" "initial"
+    commit_file "a.ts" "a" "feat: add a"
+
+    # Adopt
+    "$SUBCOMMIT" adopt HEAD >/dev/null 2>&1
+
+    # Unfold
+    "$SUBCOMMIT" unfold HEAD >/dev/null 2>&1
+    if [[ "$(git branch --show-current)" == _work/* ]]; then
+        assert_pass "adopt-flow: unfold creates _work/* branch"
+    else
+        assert_fail "adopt-flow: unfold creates _work/* branch" "got $(git branch --show-current)"
+    fi
+
+    # Append a new sub-commit
+    commit_file "b.ts" "b" "feat: add b"
+
+    # Resquash
+    local sub_id
+    sub_id=$(git branch --show-current | sed 's/_work\///')
+    "$SUBCOMMIT" resquash "$sub_id" >/dev/null 2>&1
+
+    # Verify final state
+    if [[ $(git rev-list --count main) -eq 2 ]]; then
+        assert_pass "adopt-flow: main has 2 commits"
+    else
+        assert_fail "adopt-flow: main has 2 commits" "got $(git rev-list --count main)"
+    fi
+
+    if [[ -f a.ts && -f b.ts ]]; then
+        assert_pass "adopt-flow: appended file present on main"
+    else
+        assert_fail "adopt-flow: appended file present on main" "missing files"
+    fi
+
+    local show_out
+    show_out=$("$SUBCOMMIT" show HEAD 2>&1)
+    if echo "$show_out" | grep -q "feat: add b"; then
+        assert_pass "adopt-flow: show includes appended sub-commit"
+    else
+        assert_fail "adopt-flow: show includes appended sub-commit" "missing"
+    fi
+
+    rm -rf "$dir"
+}
+
 # ── Run all tests ───────────────────────────────────────────────────────────
 
 main() {
@@ -714,6 +926,12 @@ main() {
     test_resquash_no_id
     test_gc_safety
     test_e2e_full_flow
+    test_adopt_tip
+    test_adopt_with_children
+    test_adopt_root
+    test_adopt_already_adopted
+    test_adopt_dirty
+    test_adopt_full_flow
 
     echo ""
     echo "════════════════════════════════════════════"

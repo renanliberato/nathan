@@ -30,6 +30,7 @@ _sub/id2:                   b1─b2─b3
 |---|---|
 | `git subcommit squash <branch>` | Squash a branch onto current, save micro-commits to `_sub/<id>` |
 | `git subcommit squash --range <start>..` | Squash a range of commits on current branch |
+| `git subcommit adopt <commit>` | Migrate a plain commit to the sub-commit structure |
 | `git subcommit show <commit>` | Show micro-commit log inside a squashed commit |
 | `git subcommit unfold <commit>` | Check out micro-commits as `_work/<id>` for editing |
 | `git subcommit resquash [<id>]` | Re-squash mutated micro-commits back onto main |
@@ -40,7 +41,23 @@ _sub/id2:                   b1─b2─b3
 
 ## Workflows
 
-### Workflow A: Squash a Feature Branch (ingest micro-commits)
+### Workflow A: Adopt an existing commit (migrate to sub-commit structure)
+
+Use when a commit was NOT created via `git subcommit squash` but you want to
+start managing its micro-commits with nathan.
+
+```bash
+# 1. Adopt the commit — adds Sub-commit-ref trailer, creates _sub/<id> branch
+git subcommit adopt <commit>
+
+# 2. Now it behaves like any squashed commit:
+git subcommit show HEAD                  # see sub-commit(s)
+git subcommit unfold HEAD                # check out micro-commits
+# ... add/edit/drop sub-commits ...
+git subcommit resquash                   # re-squash
+```
+
+### Workflow B: Squash a Feature Branch (ingest micro-commits)
 
 ```bash
 # 1. Create feature branch with granular commits
